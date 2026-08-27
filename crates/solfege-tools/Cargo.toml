@@ -1,0 +1,21 @@
+[package]
+name = "solfege-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+solfege-audio.workspace = true
+solfege-core.workspace = true
+solfege-engine.workspace = true
+solfege-event.workspace = true
+solfege-osmp.workspace = true
+
+[[bin]]
+name = "osmpc"
+path = "src/main.rs"
+
+[[bin]]
+name = "solfege-render"
+path = "src/bin/render.rs"

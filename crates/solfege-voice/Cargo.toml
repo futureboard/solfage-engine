@@ -1,0 +1,13 @@
+[package]
+name = "solfege-voice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+solfege-core.workspace = true
+solfege-dsp.workspace = true
+solfege-modulation.workspace = true
+solfege-resampler.workspace = true
+solfege-zone.workspace = true

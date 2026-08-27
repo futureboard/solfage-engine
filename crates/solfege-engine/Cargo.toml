@@ -1,0 +1,26 @@
+[package]
+name = "solfege-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+fbmx = ["dep:fbmx-runtime"]
+
+[dependencies]
+solfege-audio.workspace = true
+solfege-core.workspace = true
+solfege-event.workspace = true
+solfege-voice.workspace = true
+solfege-zone.workspace = true
+fbmx-runtime = { path = "../../../crates/fbmx-runtime", optional = true }
+
+[[bench]]
+name = "render"
+harness = false
+
+[dev-dependencies]
+solfege-storage.workspace = true
+solfege-zone.workspace = true

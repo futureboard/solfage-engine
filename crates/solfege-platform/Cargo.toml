@@ -1,0 +1,15 @@
+[package]
+name = "solfege-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cpal.workspace = true
+crossbeam-channel.workspace = true
+midir.workspace = true
+solfege-engine.workspace = true
+solfege-midi.workspace = true
+thiserror.workspace = true
+

@@ -1,0 +1,77 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/solfege-audio",
+    "crates/solfege-clap",
+    "crates/solfege-core",
+    "crates/solfege-dsp",
+    "crates/solfege-engine",
+    "crates/solfege-event",
+    "crates/solfege-host",
+    "crates/solfege-import-sfz",
+    "crates/solfege-library",
+    "crates/solfege-midi",
+    "crates/solfege-modulation",
+    "crates/solfege-osmp",
+    "crates/solfege-platform",
+    "crates/solfege-preset",
+    "crates/solfege-resampler",
+    "crates/solfege-state",
+    "crates/solfege-storage",
+    "crates/solfege-tools",
+    "crates/solfege-voice",
+    "crates/solfege-vst3",
+    "crates/solfege-zone",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+authors = ["Solfege contributors"]
+repository = "https://github.com/arizkami/solfege"
+
+[workspace.dependencies]
+cpal = "0.16"
+crossbeam-channel = "0.5"
+memmap2 = "0.9"
+midir = "0.10"
+thiserror = "2"
+
+solfege-audio = { path = "crates/solfege-audio" }
+solfege-clap = { path = "crates/solfege-clap" }
+solfege-core = { path = "crates/solfege-core" }
+solfege-dsp = { path = "crates/solfege-dsp" }
+solfege-engine = { path = "crates/solfege-engine" }
+solfege-event = { path = "crates/solfege-event" }
+solfege-host = { path = "crates/solfege-host" }
+solfege-import-sfz = { path = "crates/solfege-import-sfz" }
+solfege-library = { path = "crates/solfege-library" }
+solfege-midi = { path = "crates/solfege-midi" }
+solfege-modulation = { path = "crates/solfege-modulation" }
+solfege-osmp = { path = "crates/solfege-osmp" }
+solfege-platform = { path = "crates/solfege-platform" }
+solfege-preset = { path = "crates/solfege-preset" }
+solfege-resampler = { path = "crates/solfege-resampler" }
+solfege-state = { path = "crates/solfege-state" }
+solfege-storage = { path = "crates/solfege-storage" }
+solfege-tools = { path = "crates/solfege-tools" }
+solfege-voice = { path = "crates/solfege-voice" }
+solfege-vst3 = { path = "crates/solfege-vst3" }
+solfege-zone = { path = "crates/solfege-zone" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
+
+[profile.distribution]
+inherits = "release"
+lto = "fat"

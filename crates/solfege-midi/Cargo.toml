@@ -1,0 +1,10 @@
+[package]
+name = "solfege-midi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+solfege-event.workspace = true
+
