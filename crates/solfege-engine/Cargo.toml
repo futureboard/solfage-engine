@@ -12,10 +12,14 @@ fbmx = ["dep:fbmx-runtime"]
 [dependencies]
 solfege-audio.workspace = true
 solfege-core.workspace = true
+solfege-acoustic.workspace = true
 solfege-event.workspace = true
+solfege-model.workspace = true
 solfege-voice.workspace = true
 solfege-zone.workspace = true
+serde_json.workspace = true
 fbmx-runtime = { path = "../../../crates/fbmx-runtime", optional = true }
+thiserror.workspace = true
 
 [[bench]]
 name = "render"

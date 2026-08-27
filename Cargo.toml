@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/solfege-audio",
+    "crates/solfege-acoustic",
     "crates/solfege-clap",
     "crates/solfege-core",
     "crates/solfege-dsp",
@@ -12,6 +13,7 @@ members = [
     "crates/solfege-library",
     "crates/solfege-midi",
     "crates/solfege-modulation",
+    "crates/solfege-model",
     "crates/solfege-osmp",
     "crates/solfege-platform",
     "crates/solfege-preset",
@@ -37,9 +39,12 @@ cpal = "0.16"
 crossbeam-channel = "0.5"
 memmap2 = "0.9"
 midir = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 
 solfege-audio = { path = "crates/solfege-audio" }
+solfege-acoustic = { path = "crates/solfege-acoustic" }
 solfege-clap = { path = "crates/solfege-clap" }
 solfege-core = { path = "crates/solfege-core" }
 solfege-dsp = { path = "crates/solfege-dsp" }
@@ -50,6 +55,7 @@ solfege-import-sfz = { path = "crates/solfege-import-sfz" }
 solfege-library = { path = "crates/solfege-library" }
 solfege-midi = { path = "crates/solfege-midi" }
 solfege-modulation = { path = "crates/solfege-modulation" }
+solfege-model = { path = "crates/solfege-model" }
 solfege-osmp = { path = "crates/solfege-osmp" }
 solfege-platform = { path = "crates/solfege-platform" }
 solfege-preset = { path = "crates/solfege-preset" }

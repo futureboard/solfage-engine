@@ -1,0 +1,10 @@
+[package]
+name = "solfege-acoustic"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+description = "Realtime renderer for VSCO-derived Solfege ACOU/AUDO assets"
+
+[dependencies]
+solfege-model = { path = "../solfege-model" }

@@ -1,0 +1,13 @@
+[package]
+name = "solfege-model"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+description = "Checked, self-contained SFM v1 Solfege Model container"
+
+[dependencies]
+fbmx-runtime = { path = "../../../crates/fbmx-runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

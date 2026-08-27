@@ -719,6 +719,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
+name = "solfege-acoustic"
+version = "0.1.0"
+dependencies = [
+ "solfege-model",
+]
+
+[[package]]
 name = "solfege-audio"
 version = "0.1.0"
 dependencies = [
@@ -753,12 +760,16 @@ name = "solfege-engine"
 version = "0.1.0"
 dependencies = [
  "fbmx-runtime",
+ "serde_json",
+ "solfege-acoustic",
  "solfege-audio",
  "solfege-core",
  "solfege-event",
+ "solfege-model",
  "solfege-storage",
  "solfege-voice",
  "solfege-zone",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -795,6 +806,16 @@ name = "solfege-midi"
 version = "0.1.0"
 dependencies = [
  "solfege-event",
+]
+
+[[package]]
+name = "solfege-model"
+version = "0.1.0"
+dependencies = [
+ "fbmx-runtime",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -853,10 +874,12 @@ dependencies = [
 name = "solfege-tools"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "solfege-audio",
  "solfege-core",
  "solfege-engine",
  "solfege-event",
+ "solfege-model",
  "solfege-osmp",
 ]
 

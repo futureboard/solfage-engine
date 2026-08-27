@@ -8,6 +8,7 @@ use std::{
     time::Instant,
 };
 
+use solfege_acoustic::AcousticRenderer;
 use solfege_audio::SampleRate;
 use solfege_core::{GestureControl, PhysicalModel, RuntimeInstrument};
 use solfege_event::{Event, TimedEvent};
@@ -16,6 +17,7 @@ use solfege_zone::TriggerMode;
 
 #[cfg(feature = "fbmx")]
 pub mod fbmx;
+pub mod sfm;
 
 #[cfg(test)]
 mod allocation_probe {
@@ -163,6 +165,7 @@ pub struct SamplerEngine {
     sustain: bool,
     held: [bool; 128],
     deferred_release: [bool; 128],
+    acoustic: Option<AcousticRenderer>,
     metrics: Arc<SharedMetrics>,
     #[cfg(feature = "fbmx")]
     fbmx: Option<fbmx::FbmxHooks>,
@@ -209,6 +212,7 @@ impl SamplerEngine {
             sustain: false,
             held: [false; 128],
             deferred_release: [false; 128],
+            acoustic: None,
             metrics,
             #[cfg(feature = "fbmx")]
             fbmx: None,
@@ -226,6 +230,63 @@ impl SamplerEngine {
         Self::new(config, instrument, metrics)
     }
 
+    /// Prepare a complete SFM instrument on the control thread. The returned
+    /// engine owns the physical voice state and, when this crate is built with
+    /// `fbmx`, the verified embedded residual runtime. The audio callback only
+    /// sees the already-prepared engine.
+    #[allow(unused_mut)]
+    pub fn prepare_sfm(
+        config: EngineConfig,
+        model: solfege_model::SfmFile,
+        metrics: Arc<SharedMetrics>,
+        mode: sfm::SfmMode,
+    ) -> Result<Self, sfm::SfmEngineError> {
+        let profile = model.physical_profile()?;
+        let metadata = model.metadata_json()?;
+        let name = metadata
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("SFM instrument")
+            .to_owned();
+        let physical = PhysicalModel::BowedString(sfm::to_bowed_string_config(&profile));
+        let instrument = RuntimeInstrument::prepare_physical(
+            solfege_zone::Instrument {
+                name,
+                groups: Vec::new(),
+                zones: Vec::new(),
+            },
+            physical,
+        )
+        .map_err(|error| sfm::SfmEngineError::Physical(error.to_string()))?;
+        let mut engine = Self::prepare(config, Some(instrument), metrics);
+
+        if matches!(mode, sfm::SfmMode::Hybrid) {
+            if let Some(acoustic_model) = model.acoustic_model()? {
+                engine.acoustic = Some(AcousticRenderer::new(
+                    acoustic_model,
+                    config.sample_rate.get() as u32,
+                    config.polyphony,
+                ));
+            }
+        }
+
+        #[cfg(feature = "fbmx")]
+        if matches!(mode, sfm::SfmMode::Hybrid) {
+            if let Some(raw) = model.section(solfege_model::FBMX_RESIDUAL_TAG) {
+                let residual = fbmx_runtime::FbmxModel::from_bytes(raw)
+                    .map_err(|error| sfm::SfmEngineError::Fbmx(error.to_string()))?;
+                let hooks = fbmx::FbmxHooks::from_models(None, Some(residual))
+                    .map_err(|error| sfm::SfmEngineError::Fbmx(error.to_string()))?;
+                engine.set_fbmx_hooks(hooks);
+            }
+        }
+
+        #[cfg(not(feature = "fbmx"))]
+        let _ = mode;
+
+        Ok(engine)
+    }
+
     pub fn metrics(&self) -> &Arc<SharedMetrics> {
         &self.metrics
     }
@@ -234,6 +295,10 @@ impl SamplerEngine {
     /// separately through `SharedMetrics::snapshot().mapped_bytes`.
     pub fn working_memory_bytes(&self) -> usize {
         self.voices.memory_bytes()
+            + self
+                .acoustic
+                .as_ref()
+                .map_or(0, solfege_acoustic::AcousticRenderer::memory_bytes)
     }
 
     pub fn instrument_name(&self) -> Option<&str> {
@@ -264,6 +329,9 @@ impl SamplerEngine {
         self.sustain = false;
         self.held.fill(false);
         self.deferred_release.fill(false);
+        if let Some(acoustic) = self.acoustic.as_mut() {
+            acoustic.reset();
+        }
         #[cfg(feature = "fbmx")]
         if let Some(hooks) = self.fbmx.as_mut() {
             hooks.reset();
@@ -279,6 +347,7 @@ impl SamplerEngine {
     }
 
     pub fn handle_event(&mut self, event: Event) {
+        self.handle_acoustic_event(&event);
         match event {
             Event::NoteOn {
                 note,
@@ -391,8 +460,8 @@ impl SamplerEngine {
                 control,
                 value,
             } => self.set_gesture(note_id, control, value),
-            Event::Articulation { articulation, .. } =>
-            {
+            Event::Articulation { articulation, .. } => {
+                let _ = articulation;
                 #[cfg(feature = "fbmx")]
                 if let Some(hooks) = self.fbmx.as_mut() {
                     hooks.set_residual_articulation(articulation);
@@ -400,6 +469,39 @@ impl SamplerEngine {
             }
             Event::Parameter { .. } | Event::Transport { .. } => {}
             Event::Sostenuto(_) => {}
+        }
+    }
+
+    fn handle_acoustic_event(&mut self, event: &Event) {
+        let Some(acoustic) = self.acoustic.as_mut() else {
+            return;
+        };
+        match *event {
+            Event::NoteOn {
+                note,
+                velocity,
+                note_id,
+            } => acoustic.note_on(note, velocity, note_id),
+            Event::NoteOff { note, note_id, .. } => acoustic.note_off(note, note_id),
+            Event::Sustain(enabled) => acoustic.set_sustain(enabled),
+            Event::ControlChange {
+                controller, value, ..
+            } => acoustic.control_change(controller, value),
+            Event::Expression { value, .. } => acoustic.set_expression(value),
+            Event::Articulation { articulation, .. } => {
+                let index = match articulation {
+                    solfege_event::Articulation::Attack | solfege_event::Articulation::Legato => {
+                        solfege_model::acoustic::ARTICULATION_SUSTAIN_VIBRATO
+                    }
+                    solfege_event::Articulation::Release => {
+                        solfege_model::acoustic::ARTICULATION_TREMOLO
+                    }
+                    solfege_event::Articulation::Custom(value) => (value as u8).min(3),
+                };
+                acoustic.set_articulation(index);
+            }
+            Event::AllNotesOff => acoustic.all_notes_off(),
+            _ => {}
         }
     }
 
@@ -460,6 +562,12 @@ impl SamplerEngine {
                     self.config.sample_rate.get(),
                     instrument,
                 );
+            }
+            if let Some(acoustic) = self.acoustic.as_mut() {
+                let sample = acoustic.render_frame();
+                for channel in &mut output[frame_start..frame_start + channels] {
+                    *channel += sample;
+                }
             }
         }
         #[cfg(feature = "fbmx")]

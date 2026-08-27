@@ -8,9 +8,11 @@ license.workspace = true
 [dependencies]
 solfege-audio.workspace = true
 solfege-core.workspace = true
-solfege-engine.workspace = true
+solfege-engine = { workspace = true, features = ["fbmx"] }
 solfege-event.workspace = true
 solfege-osmp.workspace = true
+solfege-model.workspace = true
+serde_json.workspace = true
 
 [[bin]]
 name = "osmpc"
@@ -19,3 +21,7 @@ path = "src/main.rs"
 [[bin]]
 name = "solfege-render"
 path = "src/bin/render.rs"
+
+[[bin]]
+name = "solfage-model"
+path = "src/bin/model.rs"
