@@ -60,6 +60,31 @@ pub struct RenderReport {
 pub fn render_bowed_string(path: impl AsRef<Path>, seconds: f32) -> Result<RenderReport, String> {
     let sample_rate = 48_000_u32;
     let frames = (seconds.max(0.25) * sample_rate as f32).round() as usize;
+    render_bowed_string_note_impl(path, frames, 60, 0.8, Some(523.251_1))
+}
+
+/// Render one note with caller-selected pitch and velocity.
+///
+/// This is the offline bridge used to make a physical-render/reference pair
+/// for the VSCO research corpus.  It intentionally keeps the gesture recipe
+/// deterministic; it is a baseline reference, not a fitted violin model.
+pub fn render_bowed_string_note(
+    path: impl AsRef<Path>,
+    frames: usize,
+    midi_note: u8,
+    velocity: f32,
+) -> Result<RenderReport, String> {
+    render_bowed_string_note_impl(path, frames, midi_note, velocity, None)
+}
+
+fn render_bowed_string_note_impl(
+    path: impl AsRef<Path>,
+    frames: usize,
+    midi_note: u8,
+    velocity: f32,
+    pitch_change_hz: Option<f32>,
+) -> Result<RenderReport, String> {
+    let sample_rate = 48_000_u32;
     let rate = SampleRate::new(sample_rate as f32).map_err(|error| error.to_string())?;
     let instrument =
         RuntimeInstrument::bowed_string("Reference bowed string", BowedStringConfig::default());
@@ -76,8 +101,8 @@ pub fn render_bowed_string(path: impl AsRef<Path>, seconds: f32) -> Result<Rende
         (
             0,
             Event::NoteOn {
-                note: 60,
-                velocity: 0.8,
+                note: midi_note,
+                velocity: velocity.clamp(0.0, 1.0),
                 note_id: 9184,
             },
         ),
@@ -124,13 +149,13 @@ pub fn render_bowed_string(path: impl AsRef<Path>, seconds: f32) -> Result<Rende
             total * 3 / 4,
             Event::Pitch {
                 note_id: 9184,
-                hz: 523.251_1,
+                hz: pitch_change_hz.unwrap_or_else(|| solfege_core::midi_note_to_hz(midi_note)),
             },
         ),
         (
             release_at,
             Event::NoteOff {
-                note: 60,
+                note: midi_note,
                 velocity: 0.0,
                 note_id: 9184,
             },

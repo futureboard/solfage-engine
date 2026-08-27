@@ -285,6 +285,10 @@ impl SamplerEngine {
                 velocity,
                 note_id,
             } => {
+                #[cfg(feature = "fbmx")]
+                if let Some(hooks) = self.fbmx.as_mut() {
+                    hooks.set_residual_note(note as f32, velocity);
+                }
                 self.held[note.min(127) as usize] = true;
                 self.deferred_release[note.min(127) as usize] = false;
                 let Some(instrument) = self.instrument.as_ref() else {
@@ -387,7 +391,14 @@ impl SamplerEngine {
                 control,
                 value,
             } => self.set_gesture(note_id, control, value),
-            Event::Articulation { .. } | Event::Parameter { .. } | Event::Transport { .. } => {}
+            Event::Articulation { articulation, .. } =>
+            {
+                #[cfg(feature = "fbmx")]
+                if let Some(hooks) = self.fbmx.as_mut() {
+                    hooks.set_residual_articulation(articulation);
+                }
+            }
+            Event::Parameter { .. } | Event::Transport { .. } => {}
             Event::Sostenuto(_) => {}
         }
     }
