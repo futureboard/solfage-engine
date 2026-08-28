@@ -874,6 +874,7 @@ dependencies = [
 name = "solfege-tools"
 version = "0.1.0"
 dependencies = [
+ "fbmx-runtime",
  "serde_json",
  "solfege-audio",
  "solfege-core",
@@ -881,6 +882,7 @@ dependencies = [
  "solfege-event",
  "solfege-model",
  "solfege-osmp",
+ "solfege-storage",
 ]
 
 [[package]]

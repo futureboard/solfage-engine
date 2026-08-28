@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "Acceptance test: a drawn pitch line must be rendered at the pitch it was",
+    "drawn at. A4 = MIDI 69 = 440 Hz is held for 8 s. The first 3 s sit at the",
+    "notated pitch, the line then rises to +100 cents over 2 s and holds there",
+    "for the last 3 s.",
+    "",
+    "Measured on the last 2 s, the sounding f0 must be 466.16 Hz (440 x 2^(1/12))",
+    "within a few cents. This is the test that a pitch glide which smooths the",
+    "read rate has not also made it fall short of its target."
+  ],
+  "seconds": 8.0,
+  "block_frames": 64,
+  "expression": [{ "t": 0.0, "value": 0.8 }],
+  "notes": [
+    {
+      "start": 0.0,
+      "duration": 7.8,
+      "note": 69,
+      "velocity": 0.7,
+      "articulation": "sustain_vibrato",
+      "pitch": [
+        { "t": 0.0, "cents": 0 },
+        { "t": 3.0, "cents": 0 },
+        { "t": 5.0, "cents": 100 },
+        { "t": 7.8, "cents": 100 }
+      ]
+    }
+  ]
+}

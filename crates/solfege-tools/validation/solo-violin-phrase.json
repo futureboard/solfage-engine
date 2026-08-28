@@ -1,0 +1,80 @@
+{
+  "_comment": [
+    "The fixed validation take for the Solo Violin voicebank. Every A/B claim",
+    "about engine sound quality is made on THIS phrase, rendered before and",
+    "after, so two files can be compared sample for sample.",
+    "",
+    "It is built to expose the specific failures the renderer has been prone to:",
+    "  0-8 s    sustained tones at recorded and BETWEEN-recorded pitches, so",
+    "           transposition artefacts and dynamic-layer blending are audible",
+    "           on a held note rather than hidden under an attack.",
+    "  8-16 s   legato steps with drawn pitch lines: scoops, a slow portamento,",
+    "           and a vibrato written as data, which exercise continuous pitch.",
+    "  16-24 s  short articulated notes, where a lost or clicking release shows.",
+    "  24-40 s  one very long held note. A stateful renderer that drifts, grows",
+    "           DC, or degrades over time only reveals it here.",
+    "",
+    "Durations deliberately outrun the ~2 s recorded samples so the loop and",
+    "release paths are both entered on almost every note."
+  ],
+  "seconds": 40.0,
+  "block_frames": 64,
+  "expression": [
+    { "t": 0.0, "value": 0.75 },
+    { "t": 8.0, "value": 0.9 },
+    { "t": 16.0, "value": 0.6 },
+    { "t": 24.0, "value": 0.85 },
+    { "t": 34.0, "value": 0.5 }
+  ],
+  "notes": [
+    { "start": 0.0, "duration": 3.6, "note": 55, "velocity": 0.75, "articulation": "sustain_vibrato" },
+    { "start": 4.0, "duration": 3.6, "note": 62, "velocity": 0.55, "articulation": "sustain_vibrato" },
+
+    {
+      "start": 8.0, "duration": 3.6, "note": 67, "velocity": 0.8, "articulation": "sustain_vibrato",
+      "pitch": [
+        { "t": 0.0, "cents": -45 },
+        { "t": 0.18, "cents": 0 },
+        { "t": 1.2, "cents": 0 },
+        { "t": 1.5, "cents": 22 },
+        { "t": 1.8, "cents": -22 },
+        { "t": 2.1, "cents": 22 },
+        { "t": 2.4, "cents": -22 },
+        { "t": 2.7, "cents": 12 },
+        { "t": 3.6, "cents": 0 }
+      ]
+    },
+    {
+      "start": 12.0, "duration": 3.6, "note": 71, "velocity": 0.7, "articulation": "sustain_vibrato",
+      "pitch": [
+        { "t": 0.0, "cents": 0 },
+        { "t": 1.0, "cents": 0 },
+        { "t": 2.6, "cents": 200 },
+        { "t": 3.6, "cents": 200 }
+      ]
+    },
+
+    { "start": 16.0, "duration": 0.7, "note": 64, "velocity": 0.85, "articulation": "spiccato" },
+    { "start": 17.0, "duration": 0.7, "note": 67, "velocity": 0.85, "articulation": "spiccato" },
+    { "start": 18.0, "duration": 0.7, "note": 71, "velocity": 0.85, "articulation": "spiccato" },
+    { "start": 19.0, "duration": 1.2, "note": 74, "velocity": 0.6, "articulation": "pizzicato" },
+    { "start": 21.0, "duration": 2.4, "note": 59, "velocity": 0.7, "articulation": "tremolo" },
+
+    {
+      "start": 24.0, "duration": 15.5, "note": 69, "velocity": 0.7, "articulation": "sustain_vibrato",
+      "pitch": [
+        { "t": 0.0, "cents": 0 },
+        { "t": 2.0, "cents": 0 },
+        { "t": 2.4, "cents": 18 },
+        { "t": 2.8, "cents": -18 },
+        { "t": 3.2, "cents": 18 },
+        { "t": 3.6, "cents": -18 },
+        { "t": 4.0, "cents": 0 },
+        { "t": 8.0, "cents": 0 },
+        { "t": 10.0, "cents": 35 },
+        { "t": 12.0, "cents": -35 },
+        { "t": 15.5, "cents": 0 }
+      ]
+    }
+  ]
+}

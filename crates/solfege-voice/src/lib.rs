@@ -214,6 +214,15 @@ pub struct VoicePool {
     voices: Vec<Voice>,
     serial: u64,
     peak_active: usize,
+    /// Voices still sounding as of the last rendered frame.
+    ///
+    /// `active_count` used to scan the whole pool, which is fine once a block
+    /// but too slow to ask every frame — and asking only once a block is what
+    /// made a caller's view of "is anything sounding" depend on where the
+    /// host's block boundaries fell. A voice whose envelope ends does so at a
+    /// sample, not at a buffer edge, and `render_frame` already visits every
+    /// voice, so it publishes the count as it goes and this stays O(1).
+    active_now: usize,
 }
 
 impl VoicePool {
@@ -238,6 +247,7 @@ impl VoicePool {
             voices,
             serial: 0,
             peak_active: 0,
+            active_now: 0,
         }
     }
 
@@ -254,8 +264,16 @@ impl VoicePool {
                 .sum::<usize>()
     }
 
-    pub fn active_count(&self) -> usize {
-        self.voices.iter().filter(|voice| voice.active).count()
+    /// Voices sounding as of the last rendered frame. O(1).
+    pub const fn active_count(&self) -> usize {
+        self.active_now
+    }
+
+    /// Recount from the voices themselves. Used after events that change
+    /// activity without rendering a frame.
+    pub fn refresh_active_count(&mut self) -> usize {
+        self.active_now = self.voices.iter().filter(|voice| voice.active).count();
+        self.active_now
     }
 
     pub const fn peak_active(&self) -> usize {
@@ -325,7 +343,10 @@ impl VoicePool {
                 voice.physical.note_on(gesture);
             }
         }
-        self.peak_active = self.peak_active.max(self.active_count());
+        // Recount rather than read the cached total: this runs at note-on,
+        // before the frame that would refresh it, and the voice just taken is
+        // exactly the one the peak is meant to record.
+        self.peak_active = self.peak_active.max(self.refresh_active_count());
     }
 
     fn select_slot(&self) -> Option<usize> {
@@ -423,6 +444,7 @@ impl VoicePool {
         sample_rate: f32,
         instrument: &RuntimeInstrument,
     ) {
+        let mut active_now = 0;
         for voice in &mut self.voices {
             if !voice.active {
                 continue;
@@ -452,7 +474,13 @@ impl VoicePool {
                     }
                 }
             }
+            // Counted after rendering, because a sample voice that runs off
+            // the end of its zone retires inside `render_sample_voice`.
+            if voice.active {
+                active_now += 1;
+            }
         }
+        self.active_now = active_now;
     }
 }
 

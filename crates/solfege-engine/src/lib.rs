@@ -8,7 +8,7 @@ use std::{
     time::Instant,
 };
 
-use solfege_acoustic::AcousticRenderer;
+use solfege_acoustic::VoicebankRenderer;
 use solfege_audio::SampleRate;
 use solfege_core::{GestureControl, PhysicalModel, RuntimeInstrument};
 use solfege_event::{Event, TimedEvent};
@@ -121,6 +121,16 @@ pub struct SharedMetrics {
     mapped_bytes: AtomicU64,
     sample_rate_bits: AtomicU32,
     block_frames: AtomicUsize,
+    /// Continuous-pitch events a host could not hand to this engine because
+    /// its per-block list was already full.
+    ///
+    /// The lists are fixed-capacity so the audio thread never reallocates, but
+    /// a full list used to mean the event simply vanished. A dropped pitch
+    /// point is audible — the line stops following the drawn curve — so it is
+    /// counted and reported rather than absorbed.
+    dropped_pitch_events: AtomicU64,
+    /// Articulation events dropped for the same reason.
+    dropped_articulation_events: AtomicU64,
 }
 
 impl SharedMetrics {
@@ -135,11 +145,25 @@ impl SharedMetrics {
             mapped_bytes: self.mapped_bytes.load(Ordering::Relaxed),
             sample_rate: f32::from_bits(self.sample_rate_bits.load(Ordering::Relaxed)),
             block_frames: self.block_frames.load(Ordering::Relaxed),
+            dropped_pitch_events: self.dropped_pitch_events.load(Ordering::Relaxed),
+            dropped_articulation_events: self.dropped_articulation_events.load(Ordering::Relaxed),
         }
     }
 
     pub fn record_underrun(&self) {
         self.underruns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One continuous-pitch event was discarded because the block list was
+    /// full. Realtime-safe: one relaxed increment.
+    pub fn record_dropped_pitch_event(&self) {
+        self.dropped_pitch_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One articulation event was discarded because the block list was full.
+    pub fn record_dropped_articulation_event(&self) {
+        self.dropped_articulation_events
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -154,6 +178,8 @@ pub struct MetricsSnapshot {
     pub mapped_bytes: u64,
     pub sample_rate: f32,
     pub block_frames: usize,
+    pub dropped_pitch_events: u64,
+    pub dropped_articulation_events: u64,
 }
 
 pub struct SamplerEngine {
@@ -165,7 +191,8 @@ pub struct SamplerEngine {
     sustain: bool,
     held: [bool; 128],
     deferred_release: [bool; 128],
-    acoustic: Option<AcousticRenderer>,
+    voicebank: Option<VoicebankRenderer>,
+    peak_active_voices: usize,
     metrics: Arc<SharedMetrics>,
     #[cfg(feature = "fbmx")]
     fbmx: Option<fbmx::FbmxHooks>,
@@ -200,8 +227,12 @@ impl SamplerEngine {
                 },
             );
         Self {
+            // A voicebank-only SFM still owns the shared VoicePool type, but
+            // does not need a 128-voice physical pool. Keeping one spare
+            // physical voice makes the object shape stable while avoiding a
+            // large unused working set for the clean acoustic path.
             voices: VoicePool::with_physical_config(
-                config.polyphony,
+                instrument.as_ref().map_or(1, |_| config.polyphony),
                 config.sample_rate.get(),
                 physical_config,
             ),
@@ -212,7 +243,8 @@ impl SamplerEngine {
             sustain: false,
             held: [false; 128],
             deferred_release: [false; 128],
-            acoustic: None,
+            voicebank: None,
+            peak_active_voices: 0,
             metrics,
             #[cfg(feature = "fbmx")]
             fbmx: None,
@@ -230,17 +262,60 @@ impl SamplerEngine {
         Self::new(config, instrument, metrics)
     }
 
+    /// Clone a prepared engine for a new runtime graph without reopening or
+    /// reparsing model assets. Mutable voice state is reset, while immutable
+    /// instrument/voicebank/neural weights remain shared or cheaply cloned.
+    pub fn clone_prepared(&self) -> Self {
+        let mut clone = Self::new(
+            self.config,
+            self.instrument.clone(),
+            Arc::new(SharedMetrics::default()),
+        );
+        clone.envelope = self.envelope;
+        clone.master_gain = self.master_gain;
+        clone.voicebank = self
+            .voicebank
+            .as_ref()
+            .map(VoicebankRenderer::clone_prepared);
+        #[cfg(feature = "fbmx")]
+        {
+            clone.fbmx = self.fbmx.clone();
+        }
+        clone
+    }
+
     /// Prepare a complete SFM instrument on the control thread. The returned
-    /// engine owns the physical voice state and, when this crate is built with
-    /// `fbmx`, the verified embedded residual runtime. The audio callback only
-    /// sees the already-prepared engine.
-    #[allow(unused_mut)]
+    /// engine owns the physical voice state and the complete embedded
+    /// voicebank. When this crate is built with `fbmx`, it also owns the
+    /// verified embedded residual runtime. The audio callback only sees the
+    /// already-prepared engine.
     pub fn prepare_sfm(
         config: EngineConfig,
         model: solfege_model::SfmFile,
         metrics: Arc<SharedMetrics>,
         mode: sfm::SfmMode,
     ) -> Result<Self, sfm::SfmEngineError> {
+        Self::prepare_sfm_staged(config, model, metrics, mode, &mut |_| true)
+    }
+
+    /// [`SamplerEngine::prepare_sfm`] with the stage boundaries exposed.
+    ///
+    /// `stage` is called as each step begins and returns `false` to abandon the
+    /// load, which fails with [`sfm::SfmEngineError::Cancelled`]. Preparation
+    /// builds into locals and only moves them into the engine once every stage
+    /// has succeeded, so an abandoned load leaves no partially prepared
+    /// instrument behind for a caller to install.
+    #[allow(unused_mut)]
+    pub fn prepare_sfm_staged(
+        config: EngineConfig,
+        model: solfege_model::SfmFile,
+        metrics: Arc<SharedMetrics>,
+        mode: sfm::SfmMode,
+        stage: &mut dyn FnMut(sfm::SfmLoadStage) -> bool,
+    ) -> Result<Self, sfm::SfmEngineError> {
+        if !stage(sfm::SfmLoadStage::LoadingPhysicalModel) {
+            return Err(sfm::SfmEngineError::Cancelled);
+        }
         let profile = model.physical_profile()?;
         let metadata = model.metadata_json()?;
         let name = metadata
@@ -249,36 +324,83 @@ impl SamplerEngine {
             .unwrap_or("SFM instrument")
             .to_owned();
         let physical = PhysicalModel::BowedString(sfm::to_bowed_string_config(&profile));
-        let instrument = RuntimeInstrument::prepare_physical(
-            solfege_zone::Instrument {
-                name,
-                groups: Vec::new(),
-                zones: Vec::new(),
-            },
-            physical,
-        )
-        .map_err(|error| sfm::SfmEngineError::Physical(error.to_string()))?;
-        let mut engine = Self::prepare(config, Some(instrument), metrics);
-
-        if matches!(mode, sfm::SfmMode::Hybrid) {
-            if let Some(acoustic_model) = model.acoustic_model()? {
-                engine.acoustic = Some(AcousticRenderer::new(
-                    acoustic_model,
-                    config.sample_rate.get() as u32,
-                    config.polyphony,
-                ));
+        let instrument = if matches!(mode, sfm::SfmMode::VoicebankOnly) {
+            None
+        } else {
+            Some(
+                RuntimeInstrument::prepare_physical(
+                    solfege_zone::Instrument {
+                        name,
+                        groups: Vec::new(),
+                        zones: Vec::new(),
+                    },
+                    physical,
+                )
+                .map_err(|error| sfm::SfmEngineError::Physical(error.to_string()))?,
+            )
+        };
+        let voicebank = if matches!(mode, sfm::SfmMode::Hybrid | sfm::SfmMode::VoicebankOnly) {
+            if !stage(sfm::SfmLoadStage::LoadingVoicebank) {
+                return Err(sfm::SfmEngineError::Cancelled);
             }
+            model.voicebank_model()?
+        } else {
+            None
+        };
+
+        // Only `Hybrid` installs the residual, and that is a deliberate hold
+        // rather than an oversight.
+        //
+        // The residual is trained against the *voicebank's* own output, so on
+        // the merits it belongs on `VoicebankOnly` too — the mode the DAW
+        // actually plays. It is not enabled there because no model has passed
+        // `neural/scripts/bypass_baseline.py`, which asks the only question
+        // that decides it: on held-out data, is `model(dry)` closer to the
+        // reference than `dry` already was? The current best answers no on
+        // balance. It improves transposed notes by 2.3 dB and colours
+        // exactly-resolved ones by 18 dB, and exactly-resolved notes are the
+        // common case in normal playing.
+        //
+        // Add `SfmMode::VoicebankOnly` to this match when a model beats bypass
+        // on *both* pair kinds. Nothing else needs to change: the hooks, the
+        // per-channel runtimes and the silent-block skip are all already in
+        // place. The model tools render `Hybrid`, so measurement is unaffected
+        // by this hold.
+        #[cfg(feature = "fbmx")]
+        let residual = if matches!(mode, sfm::SfmMode::Hybrid) {
+            match model.section(solfege_model::FBMX_RESIDUAL_TAG) {
+                Some(raw) => {
+                    if !stage(sfm::SfmLoadStage::LoadingNeuralModel) {
+                        return Err(sfm::SfmEngineError::Cancelled);
+                    }
+                    let model = fbmx_runtime::FbmxModel::from_bytes(raw)
+                        .map_err(|error| sfm::SfmEngineError::Fbmx(error.to_string()))?;
+                    Some(
+                        fbmx::FbmxHooks::from_models(None, Some(model))
+                            .map_err(|error| sfm::SfmEngineError::Fbmx(error.to_string()))?,
+                    )
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        if !stage(sfm::SfmLoadStage::PreparingEngine) {
+            return Err(sfm::SfmEngineError::Cancelled);
         }
+        let mut engine = Self::prepare(config, instrument, metrics);
+        engine.voicebank = voicebank.map(|voicebank_model| {
+            VoicebankRenderer::new(
+                voicebank_model,
+                config.sample_rate.get() as u32,
+                config.polyphony,
+            )
+        });
 
         #[cfg(feature = "fbmx")]
-        if matches!(mode, sfm::SfmMode::Hybrid) {
-            if let Some(raw) = model.section(solfege_model::FBMX_RESIDUAL_TAG) {
-                let residual = fbmx_runtime::FbmxModel::from_bytes(raw)
-                    .map_err(|error| sfm::SfmEngineError::Fbmx(error.to_string()))?;
-                let hooks = fbmx::FbmxHooks::from_models(None, Some(residual))
-                    .map_err(|error| sfm::SfmEngineError::Fbmx(error.to_string()))?;
-                engine.set_fbmx_hooks(hooks);
-            }
+        if let Some(hooks) = residual {
+            engine.set_fbmx_hooks(hooks);
         }
 
         #[cfg(not(feature = "fbmx"))]
@@ -296,9 +418,9 @@ impl SamplerEngine {
     pub fn working_memory_bytes(&self) -> usize {
         self.voices.memory_bytes()
             + self
-                .acoustic
+                .voicebank
                 .as_ref()
-                .map_or(0, solfege_acoustic::AcousticRenderer::memory_bytes)
+                .map_or(0, solfege_acoustic::VoicebankRenderer::memory_bytes)
     }
 
     pub fn instrument_name(&self) -> Option<&str> {
@@ -329,8 +451,9 @@ impl SamplerEngine {
         self.sustain = false;
         self.held.fill(false);
         self.deferred_release.fill(false);
-        if let Some(acoustic) = self.acoustic.as_mut() {
-            acoustic.reset();
+        self.peak_active_voices = 0;
+        if let Some(voicebank) = self.voicebank.as_mut() {
+            voicebank.reset();
         }
         #[cfg(feature = "fbmx")]
         if let Some(hooks) = self.fbmx.as_mut() {
@@ -347,45 +470,15 @@ impl SamplerEngine {
     }
 
     pub fn handle_event(&mut self, event: Event) {
-        self.handle_acoustic_event(&event);
+        if !matches!(event, Event::NoteOn { .. }) {
+            self.handle_voicebank_event(&event);
+        }
         match event {
             Event::NoteOn {
                 note,
                 velocity,
                 note_id,
-            } => {
-                #[cfg(feature = "fbmx")]
-                if let Some(hooks) = self.fbmx.as_mut() {
-                    hooks.set_residual_note(note as f32, velocity);
-                }
-                self.held[note.min(127) as usize] = true;
-                self.deferred_release[note.min(127) as usize] = false;
-                let Some(instrument) = self.instrument.as_ref() else {
-                    return;
-                };
-                if instrument.is_physical() {
-                    self.voices
-                        .note_on(note, velocity, note_id, 0, instrument, self.envelope);
-                    return;
-                }
-                let velocity_midi = (velocity.clamp(0.0, 1.0) * 127.0).round() as u8;
-                for &zone_index in instrument.zone_index.candidates(note) {
-                    if instrument.model.zones[zone_index].matches(
-                        note,
-                        velocity_midi,
-                        TriggerMode::Attack,
-                    ) {
-                        self.voices.note_on(
-                            note,
-                            velocity,
-                            note_id,
-                            zone_index,
-                            instrument,
-                            self.envelope,
-                        );
-                    }
-                }
-            }
+            } => self.handle_note_on(note, velocity, note_id, None),
             Event::NoteOff {
                 note,
                 velocity: _,
@@ -472,35 +565,121 @@ impl SamplerEngine {
         }
     }
 
-    fn handle_acoustic_event(&mut self, event: &Event) {
-        let Some(acoustic) = self.acoustic.as_mut() else {
+    /// Start a note while forcing one prepared voicebank entry. This is a
+    /// control/offline hook for deterministic source-replacement tests and
+    /// pair generation; normal hosts should send [`Event::NoteOn`] and let
+    /// the resolver choose the source.
+    pub fn handle_note_on_with_voicebank_entry(
+        &mut self,
+        note: u8,
+        velocity: f32,
+        note_id: i32,
+        entry_index: usize,
+    ) {
+        self.handle_note_on(note, velocity, note_id, Some(entry_index));
+    }
+
+    fn handle_note_on(
+        &mut self,
+        note: u8,
+        velocity: f32,
+        note_id: i32,
+        voicebank_entry: Option<usize>,
+    ) {
+        if let Some(voicebank) = self.voicebank.as_mut() {
+            if let Some(entry_index) = voicebank_entry {
+                // `note` is honoured here. It used to be silently discarded in
+                // favour of the entry's own recorded pitch, which made it
+                // impossible to ask for "this recording, played at that pitch"
+                // — the exact situation the runtime is in for every note the
+                // bank does not contain.
+                voicebank.note_on_entry_at(entry_index, note, velocity, note_id);
+            } else {
+                voicebank.note_on(note, velocity, note_id);
+            }
+        }
+        #[cfg(feature = "fbmx")]
+        if let Some(hooks) = self.fbmx.as_mut() {
+            hooks.set_residual_note(note as f32, velocity);
+        }
+        self.held[note.min(127) as usize] = true;
+        self.deferred_release[note.min(127) as usize] = false;
+        let Some(instrument) = self.instrument.as_ref() else {
+            return;
+        };
+        if instrument.is_physical() {
+            self.voices
+                .note_on(note, velocity, note_id, 0, instrument, self.envelope);
+            return;
+        }
+        let velocity_midi = (velocity.clamp(0.0, 1.0) * 127.0).round() as u8;
+        for &zone_index in instrument.zone_index.candidates(note) {
+            if instrument.model.zones[zone_index].matches(note, velocity_midi, TriggerMode::Attack)
+            {
+                self.voices.note_on(
+                    note,
+                    velocity,
+                    note_id,
+                    zone_index,
+                    instrument,
+                    self.envelope,
+                );
+            }
+        }
+    }
+
+    fn handle_voicebank_event(&mut self, event: &Event) {
+        let Some(voicebank) = self.voicebank.as_mut() else {
             return;
         };
         match *event {
-            Event::NoteOn {
-                note,
-                velocity,
-                note_id,
-            } => acoustic.note_on(note, velocity, note_id),
-            Event::NoteOff { note, note_id, .. } => acoustic.note_off(note, note_id),
-            Event::Sustain(enabled) => acoustic.set_sustain(enabled),
+            Event::NoteOff { note, note_id, .. } => voicebank.note_off(note, note_id),
+            Event::Sustain(enabled) => voicebank.set_sustain(enabled),
             Event::ControlChange {
                 controller, value, ..
-            } => acoustic.control_change(controller, value),
-            Event::Expression { value, .. } => acoustic.set_expression(value),
+            } => voicebank.control_change(controller, value),
+            Event::Expression { note_id, value } => {
+                voicebank.set_expression(value);
+                voicebank.set_dynamic(note_id, value);
+            }
+            Event::Pitch { note_id, hz } => voicebank.set_pitch(note_id, hz),
+            Event::PitchBend { value, .. } => {
+                voicebank.set_pitch_bend(value, self.config.pitch_bend_semitones)
+            }
+            Event::Gesture {
+                note_id,
+                control,
+                value,
+            } => {
+                if matches!(
+                    control,
+                    GestureControl::Expression
+                        | GestureControl::Pressure
+                        | GestureControl::BowPressure
+                ) {
+                    voicebank.set_dynamic(note_id, value);
+                }
+            }
+            Event::NoteExpression {
+                note_id,
+                pitch,
+                pressure,
+                ..
+            } => {
+                voicebank.set_pitch(note_id, pitch);
+                voicebank.set_dynamic(note_id, pressure);
+            }
             Event::Articulation { articulation, .. } => {
                 let index = match articulation {
                     solfege_event::Articulation::Attack | solfege_event::Articulation::Legato => {
-                        solfege_model::acoustic::ARTICULATION_SUSTAIN_VIBRATO
+                        solfege_model::voicebank::ARTICULATION_SUSTAIN_VIBRATO
                     }
-                    solfege_event::Articulation::Release => {
-                        solfege_model::acoustic::ARTICULATION_TREMOLO
-                    }
-                    solfege_event::Articulation::Custom(value) => (value as u8).min(3),
+                    solfege_event::Articulation::Release => return,
+                    solfege_event::Articulation::Custom(value) => (value as u8).min(7),
                 };
-                acoustic.set_articulation(index);
+                voicebank.set_articulation(index);
             }
-            Event::AllNotesOff => acoustic.all_notes_off(),
+            Event::AllNotesOff => voicebank.all_notes_off(),
             _ => {}
         }
     }
@@ -510,6 +689,62 @@ impl SamplerEngine {
     /// filled in place.
     pub fn process(&mut self, output: &mut [f32], channels: usize, events: &[TimedEvent]) {
         self.process_interleaved(output, channels, events);
+    }
+
+    /// Render directly into separate stereo planes. This keeps a stereo
+    /// voicebank stereo in hosts that already have left/right track buffers
+    /// and avoids an interleave/deinterleave scratch buffer.
+    pub fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32], events: &[TimedEvent]) {
+        let started = Instant::now();
+        left.fill(0.0);
+        right.fill(0.0);
+        let frames = left.len().min(right.len());
+        if frames == 0 {
+            return;
+        }
+        let mut event_index = 0;
+        #[cfg(feature = "fbmx")]
+        self.refresh_residual_activity();
+        for frame in 0..frames {
+            #[cfg_attr(not(feature = "fbmx"), allow(unused_mut, unused_variables))]
+            let mut notes_changed = false;
+            while let Some(event) = events.get(event_index) {
+                if event.sample_offset() as usize > frame {
+                    break;
+                }
+                self.handle_event(event.event);
+                event_index += 1;
+                notes_changed = true;
+            }
+            let mut stereo = [0.0_f32; 2];
+            if let Some(instrument) = self.instrument.as_ref() {
+                self.voices
+                    .render_frame(&mut stereo, 2, self.config.sample_rate.get(), instrument);
+            }
+            if let Some(voicebank) = self.voicebank.as_mut() {
+                let sample = voicebank.render_frame();
+                stereo[0] += sample[0];
+                stereo[1] += sample[1];
+            }
+            #[cfg(feature = "fbmx")]
+            {
+                if notes_changed {
+                    self.refresh_residual_activity();
+                } else {
+                    self.track_residual_activity();
+                }
+                if let Some(hooks) = self.fbmx.as_mut() {
+                    hooks.process_residual_frame(&mut stereo);
+                }
+            }
+            left[frame] = stereo[0];
+            right[frame] = stereo[1];
+        }
+        for (left, right) in left[..frames].iter_mut().zip(right[..frames].iter_mut()) {
+            *left *= self.master_gain;
+            *right *= self.master_gain;
+        }
+        self.publish_stereo_metrics(&left[..frames], &right[..frames], frames, started);
     }
 
     fn set_gesture(&mut self, note_id: i32, control: GestureControl, value: f32) {
@@ -546,13 +781,18 @@ impl SamplerEngine {
         }
         let frames = output.len() / channels;
         let mut event_index = 0;
+        #[cfg(feature = "fbmx")]
+        self.refresh_residual_activity();
         for frame in 0..frames {
+            #[cfg_attr(not(feature = "fbmx"), allow(unused_mut, unused_variables))]
+            let mut notes_changed = false;
             while let Some(event) = events.get(event_index) {
                 if event.sample_offset() as usize > frame {
                     break;
                 }
                 self.handle_event(event.event);
                 event_index += 1;
+                notes_changed = true;
             }
             let frame_start = frame * channels;
             if let Some(instrument) = self.instrument.as_ref() {
@@ -563,16 +803,28 @@ impl SamplerEngine {
                     instrument,
                 );
             }
-            if let Some(acoustic) = self.acoustic.as_mut() {
-                let sample = acoustic.render_frame();
-                for channel in &mut output[frame_start..frame_start + channels] {
-                    *channel += sample;
+            if let Some(voicebank) = self.voicebank.as_mut() {
+                let sample = voicebank.render_frame();
+                if channels == 1 {
+                    output[frame_start] += (sample[0] + sample[1]) * 0.5;
+                } else if channels >= 2 {
+                    output[frame_start] += sample[0];
+                    output[frame_start + 1] += sample[1];
                 }
             }
-        }
-        #[cfg(feature = "fbmx")]
-        if let Some(hooks) = self.fbmx.as_mut() {
-            hooks.apply_residual(output);
+            #[cfg(feature = "fbmx")]
+            {
+                if notes_changed {
+                    self.refresh_residual_activity();
+                } else {
+                    self.track_residual_activity();
+                }
+                if let Some(hooks) = self.fbmx.as_mut() {
+                    hooks.process_residual_frame(
+                        &mut output[frame_start..frame_start + channels],
+                    );
+                }
+            }
         }
         for sample in output.iter_mut() {
             *sample *= self.master_gain;
@@ -580,7 +832,50 @@ impl SamplerEngine {
         self.publish_metrics(output, frames, started);
     }
 
-    fn publish_metrics(&self, output: &[f32], frames: usize, started: Instant) {
+    /// Voices the instrument is currently sounding, physical plus voicebank.
+    ///
+    /// Read before the residual runs so its state lifetime follows the notes
+    /// rather than the host's buffer size.
+    /// Push the current voice count into the residual hook.
+    ///
+    /// Called once per block and again after any event, so the 0 -> sounding
+    /// edge that resets the model's state lands on the note-on sample rather
+    /// than on a block boundary.
+    #[cfg(feature = "fbmx")]
+    fn refresh_residual_activity(&mut self) {
+        if self.fbmx.is_none() {
+            return;
+        }
+        self.voices.refresh_active_count();
+        let active_voices = self.sounding_voices();
+        if let Some(hooks) = self.fbmx.as_mut() {
+            hooks.set_active_voices(active_voices);
+        }
+    }
+
+    /// Push the post-render voice count into the residual hook.
+    ///
+    /// `VoicePool::render_frame` retires voices whose envelope has ended, so
+    /// this is the only place the 1 -> 0 edge can be seen on the exact sample
+    /// it happens rather than at the next block boundary.
+    #[cfg(feature = "fbmx")]
+    #[inline]
+    fn track_residual_activity(&mut self) {
+        let active_voices = self.sounding_voices();
+        if let Some(hooks) = self.fbmx.as_mut() {
+            hooks.set_active_voices(active_voices);
+        }
+    }
+
+    fn sounding_voices(&self) -> usize {
+        let voicebank_active = self
+            .voicebank
+            .as_ref()
+            .map_or(0, VoicebankRenderer::active_voices);
+        self.voices.active_count() + voicebank_active
+    }
+
+    fn publish_metrics(&mut self, output: &[f32], frames: usize, started: Instant) {
         let mut peak = 0.0_f32;
         let mut squares = 0.0_f64;
         for &sample in output {
@@ -592,12 +887,68 @@ impl SamplerEngine {
         } else {
             (squares / output.len() as f64).sqrt() as f32
         };
+        let voicebank_active = self
+            .voicebank
+            .as_ref()
+            .map_or(0, VoicebankRenderer::active_voices);
+        let active_voices = self.voices.active_count() + voicebank_active;
+        self.peak_active_voices = self
+            .peak_active_voices
+            .max(self.voices.peak_active())
+            .max(active_voices);
         self.metrics
             .active_voices
-            .store(self.voices.active_count(), Ordering::Relaxed);
+            .store(active_voices, Ordering::Relaxed);
         self.metrics
             .peak_voices
-            .store(self.voices.peak_active(), Ordering::Relaxed);
+            .store(self.peak_active_voices, Ordering::Relaxed);
+        self.metrics.render_micros.store(
+            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        self.metrics
+            .output_peak_bits
+            .store(peak.to_bits(), Ordering::Relaxed);
+        self.metrics
+            .output_rms_bits
+            .store(rms.to_bits(), Ordering::Relaxed);
+        self.metrics.block_frames.store(frames, Ordering::Relaxed);
+    }
+
+    fn publish_stereo_metrics(
+        &mut self,
+        left: &[f32],
+        right: &[f32],
+        frames: usize,
+        started: Instant,
+    ) {
+        let mut peak = 0.0_f32;
+        let mut squares = 0.0_f64;
+        for (&left, &right) in left.iter().zip(right.iter()) {
+            peak = peak.max(left.abs()).max(right.abs());
+            squares += (left as f64) * (left as f64) + (right as f64) * (right as f64);
+        }
+        let sample_count = left.len().saturating_add(right.len());
+        let rms = if sample_count == 0 {
+            0.0
+        } else {
+            (squares / sample_count as f64).sqrt() as f32
+        };
+        let voicebank_active = self
+            .voicebank
+            .as_ref()
+            .map_or(0, VoicebankRenderer::active_voices);
+        let active_voices = self.voices.active_count() + voicebank_active;
+        self.peak_active_voices = self
+            .peak_active_voices
+            .max(self.voices.peak_active())
+            .max(active_voices);
+        self.metrics
+            .active_voices
+            .store(active_voices, Ordering::Relaxed);
+        self.metrics
+            .peak_voices
+            .store(self.peak_active_voices, Ordering::Relaxed);
         self.metrics.render_micros.store(
             started.elapsed().as_micros().min(u64::MAX as u128) as u64,
             Ordering::Relaxed,
@@ -616,6 +967,9 @@ impl SamplerEngine {
 mod tests {
     use super::*;
     use solfege_core::PreparedSample;
+    use solfege_model::{
+        AUDIO_TAG, INDEX_TAG, METADATA_TAG, PHYSICAL_TAG, PhysicalProfile, SfmBuilder, SfmFile,
+    };
     use solfege_storage::{PcmFormat, PreloadedStorage, SampleStorage, WavLayout};
     use solfege_zone::{Instrument, Zone};
 
@@ -647,6 +1001,55 @@ mod tests {
             vec![sample],
         )
         .unwrap()
+    }
+
+    fn test_voicebank_sfm() -> SfmFile {
+        use solfege_model::voicebank::{
+            ARTICULATION_SUSTAIN_VIBRATO, FrameRange, VoicebankEntry, encode_audio, encode_index,
+        };
+
+        let entry = VoicebankEntry {
+            id: 42,
+            midi_note: 60,
+            root_pitch_hz: solfege_core::midi_note_to_hz(60),
+            articulation: ARTICULATION_SUSTAIN_VIBRATO,
+            dynamic: 0,
+            dynamic_value: 0.2,
+            round_robin: None,
+            audio_offset: 0,
+            audio_size: 64 * 2 * 2,
+            frame_count: 64,
+            sample_rate: 48_000,
+            channels: 2,
+            loop_region: FrameRange::new(8, 48),
+            attack_region: FrameRange::new(0, 8),
+            sustain_region: FrameRange::new(8, 48),
+            release_region: FrameRange::new(48, 64),
+        };
+        let index = encode_index(&[entry], 48_000, 2, 1, 64).unwrap();
+        let samples: Vec<i16> = (0..64).flat_map(|_| [12_000_i16, 6_000_i16]).collect();
+        let audio = encode_audio(48_000, 2, 1, 1, 64, &samples).unwrap();
+        let profile = PhysicalProfile::default();
+        let bytes = SfmBuilder::new()
+            .add_section(PHYSICAL_TAG, 0, profile.to_json_bytes().unwrap())
+            .unwrap()
+            .add_section(
+                METADATA_TAG,
+                0,
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "test voicebank",
+                    "architecture": "neural-voicebank"
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+            .add_section(INDEX_TAG, 0, index)
+            .unwrap()
+            .add_section(AUDIO_TAG, 0, audio)
+            .unwrap()
+            .build()
+            .unwrap();
+        SfmFile::from_bytes(&bytes).unwrap()
     }
 
     #[test]
@@ -828,6 +1231,182 @@ mod tests {
             second.process(block, 1, &[]);
         }
         assert_eq!(whole, blocks);
+    }
+
+    /// The voicebank must render the same samples however the host chops the
+    /// stream up. There was no such test for this path, only for the physical
+    /// one, and the voicebank is what the DAW actually plays.
+    #[test]
+    fn voicebank_render_is_block_size_invariant() {
+        let rate = SampleRate::new(48_000.0).unwrap();
+        let make_engine = || {
+            SamplerEngine::prepare_sfm(
+                EngineConfig::realtime(rate),
+                test_voicebank_sfm(),
+                Arc::new(SharedMetrics::default()),
+                sfm::SfmMode::VoicebankOnly,
+            )
+            .unwrap()
+        };
+        let note = [TimedEvent::immediate(Event::NoteOn {
+            note: 60,
+            velocity: 0.8,
+            note_id: 7,
+        })];
+        let mut whole = [0.0_f32; 1024];
+        let mut first = make_engine();
+        first.process(&mut whole, 2, &note);
+
+        for block_frames in [16_usize, 32, 64, 128] {
+            let mut chunked = [0.0_f32; 1024];
+            let mut engine = make_engine();
+            let stride = block_frames * 2;
+            let (head, tail) = chunked.split_at_mut(stride);
+            engine.process(head, 2, &note);
+            for block in tail.chunks_mut(stride) {
+                engine.process(block, 2, &[]);
+            }
+            assert_eq!(
+                whole, chunked,
+                "voicebank output changed at {block_frames}-frame blocks"
+            );
+        }
+    }
+
+    /// A note that stops part-way through must produce the same stream at
+    /// every block size, including the silence after it and anything that
+    /// starts again later.
+    ///
+    /// This is the partition property the residual's old silent-block reset
+    /// broke: it keyed "is the instrument idle" off whether a particular
+    /// buffer happened to be all zeros, which is a fact about the host's block
+    /// boundaries and not about the notes. The note-off here is placed at a
+    /// fixed sample, so every block size renders the same music.
+    #[test]
+    fn note_lifecycle_render_is_block_size_invariant() {
+        const FRAMES: usize = 1024;
+        const NOTE_OFF_FRAME: usize = 300;
+
+        let rate = SampleRate::new(48_000.0).unwrap();
+        let render = |block_frames: usize| -> Vec<f32> {
+            let mut engine = SamplerEngine::prepare_sfm(
+                EngineConfig::realtime(rate),
+                test_voicebank_sfm(),
+                Arc::new(SharedMetrics::default()),
+                sfm::SfmMode::VoicebankOnly,
+            )
+            .unwrap();
+            let mut out = vec![0.0_f32; FRAMES * 2];
+            let mut frame = 0;
+            while frame < FRAMES {
+                let frames_now = block_frames.min(FRAMES - frame);
+                let mut events: Vec<TimedEvent> = Vec::new();
+                if frame == 0 {
+                    events.push(TimedEvent::immediate(Event::NoteOn {
+                        note: 60,
+                        velocity: 0.8,
+                        note_id: 11,
+                    }));
+                }
+                if (frame..frame + frames_now).contains(&NOTE_OFF_FRAME) {
+                    events.push(TimedEvent::at_sample(
+                        (NOTE_OFF_FRAME - frame) as u32,
+                        Event::NoteOff {
+                            note: 60,
+                            velocity: 0.0,
+                            note_id: 11,
+                        },
+                    ));
+                }
+                let start = frame * 2;
+                let end = (frame + frames_now) * 2;
+                engine.process(&mut out[start..end], 2, &events);
+                frame += frames_now;
+            }
+            out
+        };
+
+        let reference = render(FRAMES);
+        for block_frames in [16_usize, 32, 64, 128, 256] {
+            assert_eq!(
+                reference,
+                render(block_frames),
+                "output diverged at {block_frames}-frame blocks"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_sfm_voicebank_renders_and_reports_voice_activity() {
+        let rate = SampleRate::new(48_000.0).unwrap();
+        let metrics = Arc::new(SharedMetrics::default());
+        let mut engine = SamplerEngine::prepare_sfm(
+            EngineConfig::realtime(rate),
+            test_voicebank_sfm(),
+            metrics.clone(),
+            sfm::SfmMode::VoicebankOnly,
+        )
+        .unwrap();
+        engine.handle_event(Event::NoteOn {
+            note: 60,
+            velocity: 0.8,
+            note_id: 42,
+        });
+        let mut output = [0.0_f32; 32];
+        engine.process_interleaved(&mut output, 1, &[]);
+        assert!(output.iter().any(|sample| sample.abs() > 1.0e-5));
+        assert_eq!(metrics.snapshot().active_voices, 1);
+        assert_eq!(metrics.snapshot().peak_voices, 1);
+    }
+
+    #[test]
+    fn prepared_sfm_stereo_render_preserves_voicebank_channels() {
+        let rate = SampleRate::new(48_000.0).unwrap();
+        let mut engine = SamplerEngine::prepare_sfm(
+            EngineConfig::realtime(rate),
+            test_voicebank_sfm(),
+            Arc::new(SharedMetrics::default()),
+            sfm::SfmMode::VoicebankOnly,
+        )
+        .unwrap();
+        engine.handle_event(Event::NoteOn {
+            note: 60,
+            velocity: 0.8,
+            note_id: 42,
+        });
+        let mut left = [0.0_f32; 32];
+        let mut right = [0.0_f32; 32];
+        engine.process_stereo(&mut left, &mut right, &[]);
+        assert!(left.iter().any(|sample| sample.abs() > 1.0e-5));
+        assert!(right.iter().any(|sample| sample.abs() > 1.0e-5));
+        assert!(
+            left.iter()
+                .zip(right)
+                .any(|(left, right)| (left - right).abs() > 1.0e-5)
+        );
+    }
+
+    #[test]
+    fn prepared_sfm_steady_state_render_does_not_allocate() {
+        let rate = SampleRate::new(48_000.0).unwrap();
+        let mut engine = SamplerEngine::prepare_sfm(
+            EngineConfig::realtime(rate),
+            test_voicebank_sfm(),
+            Arc::new(SharedMetrics::default()),
+            sfm::SfmMode::VoicebankOnly,
+        )
+        .unwrap();
+        engine.handle_event(Event::NoteOn {
+            note: 60,
+            velocity: 0.8,
+            note_id: 42,
+        });
+        let mut output = [0.0_f32; 64];
+        engine.process_interleaved(&mut output, 1, &[]);
+        let allocations = crate::allocation_probe::count(|| {
+            engine.process_interleaved(&mut output, 1, &[]);
+        });
+        assert_eq!(allocations, 0);
     }
 
     #[test]

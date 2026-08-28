@@ -9,10 +9,40 @@ pub enum SfmMode {
     /// Run only the deterministic physical instrument. This path is always
     /// available, including in builds without the optional FBMX feature.
     PhysicalOnly,
+    /// Run only the embedded indexed acoustic voicebank.
+    VoicebankOnly,
     /// Run the physical instrument and add the embedded causal FBMX residual
     /// when the feature and section are available; otherwise physical output
     /// remains a valid fallback.
     Hybrid,
+}
+
+/// The step a model load reached.
+///
+/// Carried on every failure so a host can say *which* part of a package is
+/// broken. "Failed to load model" is not a usable diagnosis for a 146 MB file
+/// with seven independently checksummed sections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SfmLoadStage {
+    Opening,
+    Validating,
+    LoadingPhysicalModel,
+    LoadingVoicebank,
+    LoadingNeuralModel,
+    PreparingEngine,
+}
+
+impl SfmLoadStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Opening => "Opening",
+            Self::Validating => "Validating",
+            Self::LoadingPhysicalModel => "Loading physical model",
+            Self::LoadingVoicebank => "Loading voicebank",
+            Self::LoadingNeuralModel => "Loading neural model",
+            Self::PreparingEngine => "Preparing engine",
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -23,6 +53,34 @@ pub enum SfmEngineError {
     Physical(String),
     #[error("FBMX preparation failed: {0}")]
     Fbmx(String),
+    /// The package parsed, but the paired `INDX`/`AUDO` voicebank a sampled
+    /// instrument needs is not complete. Distinguishes a physical-only package
+    /// from a half-built one, which the caller cannot tell from a bare `None`.
+    #[error(
+        "SFM voicebank sections are incomplete: INDX {}, AUDO {}",
+        if *index { "present" } else { "missing" },
+        if *audio { "present" } else { "missing" }
+    )]
+    VoicebankSectionsMissing { index: bool, audio: bool },
+    #[error("SFM load was cancelled")]
+    Cancelled,
+}
+
+impl SfmEngineError {
+    /// The stage this failure came from, for a message that names the step.
+    pub fn stage(&self) -> SfmLoadStage {
+        match self {
+            Self::Format(SfmError::Io(_)) => SfmLoadStage::Opening,
+            Self::Format(SfmError::InvalidPhysicalProfile(_)) | Self::Physical(_) => {
+                SfmLoadStage::LoadingPhysicalModel
+            }
+            Self::Format(SfmError::InvalidVoicebank(_))
+            | Self::Format(SfmError::InvalidAcousticAsset(_))
+            | Self::VoicebankSectionsMissing { .. } => SfmLoadStage::LoadingVoicebank,
+            Self::Fbmx(_) => SfmLoadStage::LoadingNeuralModel,
+            Self::Cancelled | Self::Format(_) => SfmLoadStage::Validating,
+        }
+    }
 }
 
 pub fn to_bowed_string_config(profile: &PhysicalProfile) -> BowedStringConfig {

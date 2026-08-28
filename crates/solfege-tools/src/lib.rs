@@ -1,5 +1,7 @@
 //! Offline OSMP compiler/inspection tool support.
 
+pub mod performance;
+
 use std::{fmt::Write, fs, io::Write as IoWrite, path::Path};
 
 use solfege_audio::SampleRate;

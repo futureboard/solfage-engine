@@ -12,7 +12,9 @@ solfege-engine = { workspace = true, features = ["fbmx"] }
 solfege-event.workspace = true
 solfege-osmp.workspace = true
 solfege-model.workspace = true
+solfege-storage.workspace = true
 serde_json.workspace = true
+fbmx-runtime = { path = "../../../crates/fbmx-runtime" }
 
 [[bin]]
 name = "osmpc"

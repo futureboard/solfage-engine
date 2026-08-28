@@ -63,14 +63,25 @@ impl DigitalWaveguide {
 
     #[inline]
     pub fn read(&self, delay_samples: f32) -> f32 {
-        let max_delay = (self.buffer.len() - 3) as f32;
-        let delay = delay_samples.clamp(1.0, max_delay);
-        let position = self.write_index as f32 - delay;
-        let length = self.buffer.len() as f32;
-        let wrapped = position.rem_euclid(length);
-        let index = wrapped.floor() as usize;
-        let fraction = wrapped - index as f32;
-        let next = (index + 1) % self.buffer.len();
+        let length = self.buffer.len();
+        let max_delay = (length - 3) as f32;
+        // A non-finite delay would poison `rem_euclid` and then the whole
+        // waveguide; treat it as the shortest delay rather than propagating it.
+        let delay = if delay_samples.is_finite() {
+            delay_samples.clamp(1.0, max_delay)
+        } else {
+            1.0
+        };
+        let wrapped = (self.write_index as f32 - delay).rem_euclid(length as f32);
+        // `f32::rem_euclid` can return exactly the modulus for inputs a hair
+        // below zero, because the true remainder is not representable and
+        // rounds up. Indexing on that value panics — in the audio callback,
+        // which must never unwind across the host boundary. `min` here is the
+        // guard, not an optimisation: it costs one instruction and removes a
+        // crash that only appears at particular pitches.
+        let index = (wrapped.floor() as usize).min(length - 1);
+        let fraction = (wrapped - index as f32).clamp(0.0, 1.0);
+        let next = if index + 1 == length { 0 } else { index + 1 };
         self.buffer[index] + (self.buffer[next] - self.buffer[index]) * fraction
     }
 
@@ -429,6 +440,45 @@ fn finite_or_zero(value: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// `read` must never index out of bounds, whatever the delay.
+    ///
+    /// The regression this pins: `f32::rem_euclid` can return exactly the
+    /// modulus for a value a hair below zero, which used to index one past the
+    /// end and panic *inside the audio callback*. It reproduced only at
+    /// particular delay values, so the sweep here is deliberately fine.
+    #[test]
+    fn waveguide_read_is_in_bounds_for_every_delay() {
+        for size in [8usize, 9, 64, 2400, 2401] {
+            let mut line = DigitalWaveguide::new(size);
+            for i in 0..line.buffer.len() {
+                line.write_and_advance(i as f32 * 0.001);
+            }
+            for step in 0..20_000 {
+                let delay = step as f32 * (size as f32 + 8.0) / 20_000.0;
+                let value = line.read(delay);
+                assert!(value.is_finite(), "size {size} delay {delay} gave {value}");
+            }
+            // Explicitly cover the write positions where the subtraction lands
+            // just below zero, which is where the rounding bug lived.
+            for write_index in 0..line.buffer.len() {
+                line.write_index = write_index;
+                for delta in [-1e-6f32, 0.0, 1e-6] {
+                    let delay = write_index as f32 + delta;
+                    assert!(line.read(delay).is_finite());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn waveguide_read_ignores_a_non_finite_delay() {
+        let mut line = DigitalWaveguide::new(64);
+        line.write_and_advance(0.5);
+        for delay in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(line.read(delay).is_finite());
+        }
+    }
     use super::*;
 
     #[test]

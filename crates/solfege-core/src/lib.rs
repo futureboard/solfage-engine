@@ -371,6 +371,7 @@ pub enum SynthesisBackend {
     Hybrid(PhysicalModel),
 }
 
+#[derive(Clone)]
 pub struct PreparedSample {
     storage: Arc<dyn SampleStorage>,
     layout: WavLayout,
@@ -459,6 +460,7 @@ fn decode_pcm(format: PcmFormat, bytes: &[u8]) -> f32 {
     }
 }
 
+#[derive(Clone)]
 pub struct RuntimeInstrument {
     pub model: Instrument,
     pub zone_index: ZoneIndex,
