@@ -6,8 +6,9 @@ use std::{fmt::Write, fs, io::Write as IoWrite, path::Path};
 
 use solfege_audio::SampleRate;
 use solfege_core::{BowedStringConfig, GestureControl, RuntimeInstrument};
-use solfege_engine::{EngineConfig, SamplerEngine, SharedMetrics};
+use solfege_engine::{EngineConfig, SamplerEngine, SharedMetrics, sfm::SfmMode};
 use solfege_event::{Event, TimedEvent};
+use solfege_model::SfmFile;
 
 /// Offline/research seam for fitting physical parameters from a recording.
 /// Implementations may call Python/PyTorch and produce a versioned
@@ -19,6 +20,126 @@ pub trait PhysicalParameterEstimator {
         recording: &[f32],
         sample_rate: f32,
     ) -> Result<BowedStringConfig, String>;
+}
+
+/// One offline high-quality render, described rather than performed.
+///
+/// The engine has an offline render path, but until now it existed only inside
+/// `solfage-model`'s argument parsing, which meant the only way to call it was
+/// to build a command line. This is the same path expressed as a value, so a
+/// test, a dataset build, a research script or a future host integration can ask
+/// for a render without going through `main`.
+///
+/// It deliberately knows nothing about any UI. There is no progress callback, no
+/// cancellation token and no editor state here: this is the engine's offline
+/// contract, and anything that wants to draw a progress bar around it owns that
+/// itself.
+#[derive(Debug, Clone)]
+pub struct OfflineRenderRequest<'a> {
+    /// The instrument: a compiled `.sfm`.
+    pub model: &'a Path,
+    /// A performance document (see [`performance`]).
+    pub performance: &'a Path,
+    /// Which layers to sound.
+    pub mode: SfmMode,
+    /// Whether to run the embedded FBMX waveform residual, where the mode
+    /// installs one. Kept as an explicit flag rather than implied by the mode so
+    /// a caller can render the same performance with and without it and compare
+    /// — which is how the residual gets measured rather than assumed.
+    pub residual: bool,
+    /// Force a block size. `None` uses the document's own.
+    ///
+    /// A render that changes with this is a render with a block-size dependence,
+    /// so being able to set it is a diagnostic, not a tuning knob.
+    pub block_frames: Option<usize>,
+}
+
+/// The audio, and enough measurement to tell whether it is worth listening to.
+#[derive(Debug, Clone)]
+pub struct OfflineRender {
+    pub sample_rate: u32,
+    pub samples: Vec<f32>,
+    pub block_frames: usize,
+    pub seconds: f32,
+    pub peak: f32,
+    pub rms: f32,
+    /// Mean sample value. Reported because the bowed-string layer contributes a
+    /// small DC offset that the voicebank does not, and a renderer downstream of
+    /// this one will otherwise learn it as part of the instrument.
+    pub dc: f64,
+    pub non_finite: usize,
+}
+
+/// Render a performance document offline, at the model's own sample rate.
+///
+/// `articulation_of` maps the document's articulation names onto the model's
+/// ids, so this stays independent of any one instrument's articulation set —
+/// the same seam [`performance::parse`] uses.
+pub fn render_performance(
+    request: &OfflineRenderRequest<'_>,
+    default_articulation: u8,
+    articulation_of: &dyn Fn(&str) -> Option<u8>,
+) -> Result<OfflineRender, String> {
+    let sfm = SfmFile::open(request.model).map_err(|error| error.to_string())?;
+    let profile = sfm.physical_profile().map_err(|error| error.to_string())?;
+    let sample_rate = profile.sample_rate;
+
+    let document = performance::load(request.performance)?;
+    let parsed = performance::parse(
+        &document,
+        sample_rate,
+        default_articulation,
+        articulation_of,
+    )?;
+    let block_frames = request.block_frames.unwrap_or(parsed.block_frames).max(1);
+    let total_frames = (parsed.seconds * sample_rate as f32).round() as usize;
+
+    let rate = SampleRate::new(sample_rate as f32).map_err(|error| error.to_string())?;
+    let mut config = EngineConfig::realtime(rate);
+    // The engine must be prepared for the block size actually used, so a
+    // smaller override is not silently rendered in 64-frame chunks.
+    config.max_block_frames = block_frames;
+    config.polyphony = 16;
+    let metrics = std::sync::Arc::new(SharedMetrics::default());
+    let mut engine = SamplerEngine::prepare_sfm(config, sfm, metrics, request.mode)
+        .map_err(|error| error.to_string())?;
+    if !request.residual {
+        engine.clear_fbmx_hooks();
+    }
+
+    let mut by_block = performance::blocks(&parsed, total_frames, block_frames);
+    let mut samples = vec![0.0_f32; total_frames];
+    let mut frame = 0usize;
+    let mut block_index = 0usize;
+    let empty: Vec<TimedEvent> = Vec::new();
+    while frame < total_frames {
+        let frames = block_frames.min(total_frames - frame);
+        let events = by_block
+            .remove(&block_index)
+            .unwrap_or_else(|| empty.clone());
+        engine.process_interleaved(&mut samples[frame..frame + frames], 1, &events);
+        frame += frames;
+        block_index += 1;
+    }
+
+    let peak = samples
+        .iter()
+        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+    let sum_squares: f64 = samples.iter().map(|s| (*s as f64) * (*s as f64)).sum();
+    let rms = (sum_squares / total_frames.max(1) as f64).sqrt() as f32;
+    let dc = samples.iter().map(|s| *s as f64).sum::<f64>() / total_frames.max(1) as f64;
+    let non_finite = samples.iter().filter(|s| !s.is_finite()).count();
+
+    Ok(OfflineRender {
+        sample_rate,
+        samples,
+        block_frames,
+        seconds: parsed.seconds,
+        peak,
+        rms,
+        dc,
+        non_finite,
+    })
 }
 
 pub fn inspect(path: impl AsRef<Path>) -> Result<String, String> {

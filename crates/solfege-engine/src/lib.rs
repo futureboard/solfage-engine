@@ -820,9 +820,7 @@ impl SamplerEngine {
                     self.track_residual_activity();
                 }
                 if let Some(hooks) = self.fbmx.as_mut() {
-                    hooks.process_residual_frame(
-                        &mut output[frame_start..frame_start + channels],
-                    );
+                    hooks.process_residual_frame(&mut output[frame_start..frame_start + channels]);
                 }
             }
         }

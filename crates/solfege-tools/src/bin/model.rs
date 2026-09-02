@@ -10,21 +10,21 @@ use std::{
 };
 
 use fbmx_runtime::FbmxModel;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use solfege_audio::SampleRate;
 use solfege_core::GestureControl;
-use solfege_engine::{sfm::SfmMode, EngineConfig, SamplerEngine, SharedMetrics};
+use solfege_engine::{EngineConfig, SamplerEngine, SharedMetrics, sfm::SfmMode};
 use solfege_event::{Articulation, Event, TimedEvent};
 use solfege_model::{
+    ACOUSTIC_TAG, AUDIO_TAG, BODY_TAG, FBMX_ACCENT_TAG, FBMX_PERFORMER_TAG, FBMX_RESIDUAL_TAG,
+    INDEX_TAG, METADATA_TAG, PHYSICAL_TAG, PhysicalProfile, SfmBuilder, SfmFile,
     voicebank::{
-        encode_audio, encode_index, FrameRange, VoicebankEntry, ARTICULATION_PIZZICATO,
-        ARTICULATION_SPICCATO, ARTICULATION_SUSTAIN_VIBRATO, ARTICULATION_TREMOLO, DYNAMIC_F,
-        DYNAMIC_P, DYNAMIC_V1, DYNAMIC_V2,
+        ARTICULATION_PIZZICATO, ARTICULATION_SPICCATO, ARTICULATION_SUSTAIN_VIBRATO,
+        ARTICULATION_TREMOLO, DYNAMIC_F, DYNAMIC_P, DYNAMIC_V1, DYNAMIC_V2, FrameRange,
+        VoicebankEntry, encode_audio, encode_index,
     },
-    PhysicalProfile, SfmBuilder, SfmFile, ACOUSTIC_TAG, AUDIO_TAG, BODY_TAG, FBMX_ACCENT_TAG,
-    FBMX_PERFORMER_TAG, FBMX_RESIDUAL_TAG, INDEX_TAG, METADATA_TAG, PHYSICAL_TAG,
 };
-use solfege_storage::{parse_wav, PcmFormat, PreloadedStorage, SampleStorage};
+use solfege_storage::{PcmFormat, PreloadedStorage, SampleStorage, parse_wav};
 
 const CANONICAL_SAMPLE_RATE: u32 = 48_000;
 const COMPILER_VERSION: &str = "solfage-voicebank-1";
@@ -655,65 +655,42 @@ fn render_perf(args: Vec<String>) -> Result<String, String> {
         Some("hybrid") => SfmMode::Hybrid,
         Some(other) => return Err(format!("unknown render mode '{other}'")),
     };
-    let fbmx_enabled = !args.iter().any(|arg| arg == "--no-fbmx");
-    let block_override = args
+    let residual = !args.iter().any(|arg| arg == "--no-fbmx");
+    let block_frames = args
         .iter()
         .position(|arg| arg == "--block")
         .and_then(|index| args.get(index + 1))
         .and_then(|value| value.parse::<usize>().ok());
+    // Guide renders feed a model, not a listener; see `write_mono_wav_f32`.
+    let float32 = args.iter().any(|arg| arg == "--f32");
 
-    let sfm = SfmFile::open(model_path).map_err(|error| error.to_string())?;
-    let profile = sfm.physical_profile().map_err(|error| error.to_string())?;
-    let sample_rate = profile.sample_rate;
-    let document = solfege_tools::performance::load(Path::new(performance_path))?;
-    let performance = solfege_tools::performance::parse(
-        &document,
-        sample_rate,
-        ARTICULATION_SUSTAIN_VIBRATO,
-        &|name| articulation_id(Some(name)),
-    )?;
-    let block_frames = block_override.unwrap_or(performance.block_frames).max(1);
-    let total_frames = (performance.seconds * sample_rate as f32).round() as usize;
+    let request = solfege_tools::OfflineRenderRequest {
+        model: Path::new(model_path),
+        performance: Path::new(performance_path),
+        mode,
+        residual,
+        block_frames,
+    };
+    let render =
+        solfege_tools::render_performance(&request, ARTICULATION_SUSTAIN_VIBRATO, &|name| {
+            articulation_id(Some(name))
+        })?;
 
-    let rate = SampleRate::new(sample_rate as f32).map_err(|error| error.to_string())?;
-    let mut config = EngineConfig::realtime(rate);
-    // The engine must be prepared for the block size actually used, so a
-    // smaller override is not silently rendered in 64-frame chunks.
-    config.max_block_frames = block_frames;
-    config.polyphony = 16;
-    let metrics = std::sync::Arc::new(SharedMetrics::default());
-    let mut engine = SamplerEngine::prepare_sfm(config, sfm, metrics, mode)
-        .map_err(|error| error.to_string())?;
-    if !fbmx_enabled {
-        engine.clear_fbmx_hooks();
+    if float32 {
+        write_mono_wav_f32(output_path, render.sample_rate, &render.samples)?;
+    } else {
+        write_mono_wav(output_path, render.sample_rate, &render.samples)?;
     }
-
-    let mut by_block = solfege_tools::performance::blocks(&performance, total_frames, block_frames);
-    let mut output = vec![0.0_f32; total_frames];
-    let mut frame = 0usize;
-    let mut block_index = 0usize;
-    let empty: Vec<solfege_event::TimedEvent> = Vec::new();
-    while frame < total_frames {
-        let frames = block_frames.min(total_frames - frame);
-        let events = by_block
-            .remove(&block_index)
-            .unwrap_or_else(|| empty.clone());
-        engine.process_interleaved(&mut output[frame..frame + frames], 1, &events);
-        frame += frames;
-        block_index += 1;
-    }
-
-    write_mono_wav(output_path, sample_rate, &output)?;
-    let peak = output
-        .iter()
-        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
-    let dc = output.iter().map(|s| *s as f64).sum::<f64>() / total_frames.max(1) as f64;
-    let non_finite = output.iter().filter(|s| !s.is_finite()).count();
     Ok(format!(
-        "render-perf mode={mode:?} fbmx={fbmx_enabled} block_frames={block_frames} \
-         seconds={:.3} frames={total_frames} peak={peak:.6} rms={:.6} dc={dc:.8} non_finite={non_finite}\n{}",
-        performance.seconds,
-        rms(&output),
+        "render-perf mode={mode:?} fbmx={residual} block_frames={} f32={float32} \
+         seconds={:.3} frames={} peak={:.6} rms={:.6} dc={:.8} non_finite={}\n{}",
+        render.block_frames,
+        render.seconds,
+        render.samples.len(),
+        render.peak,
+        render.rms,
+        render.dc,
+        render.non_finite,
         output_path
     ))
 }
@@ -1569,6 +1546,41 @@ fn write_stereo_wav(path: &str, sample_rate: u32, frames: &[[f32; 2]]) -> Result
     file.write_all(&bytes).map_err(|error| error.to_string())
 }
 
+/// Write mono 32-bit IEEE float PCM.
+///
+/// The 16-bit writer is right for a listening render, but a guide signal is
+/// consumed by a model rather than heard: quantising it to 16 bits puts the
+/// quantisation floor only ~80 dB below these renders' ~0.3 peak, and a
+/// renderer trained on that guide learns the floor as part of the instrument.
+fn write_mono_wav_f32(path: &str, sample_rate: u32, samples: &[f32]) -> Result<(), String> {
+    let data_len = samples
+        .len()
+        .checked_mul(4)
+        .ok_or_else(|| "WAV data length overflow".to_owned())?;
+    let riff_len = 36_usize
+        .checked_add(data_len)
+        .ok_or_else(|| "WAV RIFF length overflow".to_owned())?;
+    let mut bytes = Vec::with_capacity(44 + data_len);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(riff_len as u32).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16_u32.to_le_bytes());
+    // 3 == WAVE_FORMAT_IEEE_FLOAT
+    bytes.extend_from_slice(&3_u16.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&(sample_rate * 4).to_le_bytes());
+    bytes.extend_from_slice(&4_u16.to_le_bytes());
+    bytes.extend_from_slice(&32_u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&(data_len as u32).to_le_bytes());
+    for &sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    let mut file = fs::File::create(path).map_err(|error| error.to_string())?;
+    file.write_all(&bytes).map_err(|error| error.to_string())
+}
+
 fn write_mono_wav(path: &str, sample_rate: u32, samples: &[f32]) -> Result<(), String> {
     let data_len = samples
         .len()
@@ -2049,6 +2061,6 @@ fn usage() {
     );
     eprintln!("  solfage-model benchmark <model.sfm> [blocks]");
     eprintln!(
-        "  solfage-model ablation <model.sfm> <output-dir> [seconds]\n  solfage-model render-perf <model.sfm> <performance.json> <output.wav> [voicebank|physical|hybrid] [--no-fbmx] [--block N]\n  solfage-model render-batch <model.sfm> <dataset-root> <manifest.jsonl> <out-dir> [max-seconds] [voicebank|physical|hybrid]\n  solfage-model render-transposed <model.sfm> <jobs.json> <out-dir> [max-seconds]"
+        "  solfage-model ablation <model.sfm> <output-dir> [seconds]\n  solfage-model render-perf <model.sfm> <performance.json> <output.wav> [voicebank|physical|hybrid] [--no-fbmx] [--block N] [--f32]\n  solfage-model render-batch <model.sfm> <dataset-root> <manifest.jsonl> <out-dir> [max-seconds] [voicebank|physical|hybrid]\n  solfage-model render-transposed <model.sfm> <jobs.json> <out-dir> [max-seconds]"
     );
 }
