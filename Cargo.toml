@@ -41,6 +41,9 @@ memmap2 = "0.9"
 midir = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# FBMX container loader/inference runtime, published as its own repository so
+# this workspace no longer reaches outside its checkout for it.
+fbmx-runtime = { git = "https://github.com/futureboard/fbmx-runtime" }
 thiserror = "2"
 
 solfege-audio = { path = "crates/solfege-audio" }

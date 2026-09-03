@@ -18,7 +18,7 @@ solfege-model.workspace = true
 solfege-voice.workspace = true
 solfege-zone.workspace = true
 serde_json.workspace = true
-fbmx-runtime = { path = "../../../crates/fbmx-runtime", optional = true }
+fbmx-runtime = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [[bench]]
